@@ -3,7 +3,9 @@
 1. 用本地语料 data/corpus.json 构建索引;
 2. 手工查询 + 随机查询:BlockMax WAND 与穷举(全量计分后排序)逐位比对前 k;
 3. 独立参照实现(不经过索引结构,直接按公式对原始语料计分)交叉验证;
-4. 打印完整计分篇数,展示确有候选被块上界跳过(WAND scored << 穷举 N)。
+4. 打印完整计分篇数,展示确有候选被块上界跳过(WAND scored << 穷举 N);
+5. 分词纠错:在语料副本中制造错词,验证建议命中正确词;小语料上
+   用穷举所有候选组合交叉验证动态规划的整句最优选择。
 
 用法: python3 scripts/verify.py
 退出码非 0 表示不一致。
@@ -57,6 +59,64 @@ def check_equal(tag: str, a, b) -> bool:
         print("  reference      :", kb[:8])
         return False
     return True
+
+
+def brute_force_best(tokens, stats):
+    """穷举所有 原词/编辑距离 1 候选 的组合,返回 (得分, 替换数) 最优序列。"""
+    import itertools
+
+    from app.correction import _candidates, _log_adjacent
+
+    choices = [[tok] + _candidates(tok, stats) for tok in tokens]
+    best_seq, best_key = None, None
+    for seq in itertools.product(*choices):
+        score = sum(_log_adjacent(u, v, stats) for u, v in zip(seq, seq[1:]))
+        reps = sum(1 for a, b in zip(tokens, seq) if a != b)
+        score += math.log(0.5) * reps
+        key = (round(score, 12), -reps)
+        if best_key is None or key > best_key:
+            best_seq, best_key = seq, key
+    return best_key
+
+
+def verify_correction(docs: dict) -> int:
+    """在真实语料上注入错词验证建议,并用穷举交叉验证整句动态规划。"""
+    from app.correction import _choose_sequence, build_adjacency_stats, build_suggestion
+
+    failures = 0
+
+    # 5a. 真实语料:把某篇的机器名改错一个字,建议应改回语料支持的写法
+    sample = next(did for did, (_t, toks) in docs.items() if len(toks) >= 3 and toks[1])
+    text, toks = docs[sample]
+    bad = toks[1][:-1] + "垫"
+    if bad == toks[1]:
+        bad = toks[1] + "垫"
+    corrupted = dict(docs)
+    corrupted[sample] = (text, (toks[0], bad) + tuple(toks[2:]))
+    sug = build_suggestion(corrupted, 0, sample)
+    ok = bool(sug.replacements) and sug.suggested_tokens[1] == toks[1]
+    print(f"注入错词 {bad!r} -> 建议 {sug.suggested_tokens[1]!r}(原 {toks[1]!r}):"
+          f"{'通过' if ok else '失败'}")
+    failures += 0 if ok else 1
+
+    # 5b. 小语料:动态规划 vs 候选组合穷举,逐位一致
+    small = {
+        "D1": ("t", ("aa", "ab", "bb")),
+        "D2": ("t", ("aa", "ac", "bb")),
+        "D3": ("t", ("aa", "ac", "bb")),
+        "D4": ("t", ("ad", "bb")),
+    }
+    for did, (_t, toks) in small.items():
+        stats = build_adjacency_stats(small, did)
+        sug_tokens, sug_score, reps = _choose_sequence(toks, stats)
+        bf_key = brute_force_best(toks, stats)
+        dp_key = (round(sug_score, 12), -len(reps))
+        if dp_key != bf_key:
+            print(f"[FAIL] 纠错动态规划 {did}: dp={dp_key} 穷举={bf_key}")
+            failures += 1
+    print(f"小语料 {len(small)} 篇:动态规划与候选穷举逐条一致")
+
+    return failures
 
 
 def main() -> int:
@@ -142,6 +202,10 @@ def main() -> int:
     )
     print(f"查询 {terms}, k={k}:完整计分 {w_scored} 篇;含查询词的文档 {contain} 篇;全库 {n} 篇")
     print(f"即 {contain - w_scored} 篇含词候选未经完整计分即被块上界跳过,前 {k} 名与穷举完全一致。")
+
+    # ---- 5. 分词纠错:真实语料注入错词 + 动态规划对照穷举 ----
+    print("\n== 分词纠错验证 ==")
+    failures += verify_correction(docs)
 
     print("\n结果:", "全部通过" if failures == 0 else f"失败 {failures} 处")
     return 0 if failures == 0 else 1

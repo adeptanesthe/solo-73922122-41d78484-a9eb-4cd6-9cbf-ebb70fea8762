@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hmac
 import math
 import threading
 import time
@@ -17,6 +18,13 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
+
+from .correction import (
+    RecordNotFound,
+    RevisionConflict,
+    SuggestionMismatch,
+    build_suggestion,
+)
 
 K1 = 1.2
 B = 0.75
@@ -44,6 +52,7 @@ class State:
     """一次完整生效的不可变检索状态:语料 + 全库统计 + 剪枝依据。
 
     构建完成后任何字段都不再修改;查询全程持有同一引用即保证一致性。
+    ``revision`` 是语料修订号:每次成功的批量更正或确认纠错后加一。
     """
 
     docs: dict  # 编号 -> (正文, 分词序列 tuple);按约定不再修改
@@ -52,9 +61,10 @@ class State:
     n: int  # 总篇数 N(空文档计入)
     avgdl: float  # 平均文档长度(空文档按 0 计入)
     terms: dict  # 词项 -> TermData
+    revision: int = 0  # 语料修订号,单调递增
 
 
-def build_state(docs: dict) -> State:
+def build_state(docs: dict, revision: int = 0) -> State:
     """由 {编号: (正文, 分词序列)} 构建完整状态。空文档计入 N 与平均长度。"""
     ids = tuple(sorted(docs.keys()))
     n = len(ids)
@@ -95,7 +105,9 @@ def build_state(docs: dict) -> State:
             docids=docids, contribs=contribs, block_last=block_last, suffix_max=suffix_max
         )
 
-    return State(docs=docs, ids=ids, texts=texts, n=n, avgdl=avgdl, terms=terms)
+    return State(
+        docs=docs, ids=ids, texts=texts, n=n, avgdl=avgdl, terms=terms, revision=revision
+    )
 
 
 class _Cursor:
@@ -230,6 +242,7 @@ class IndexManager:
 
     - 查询不取锁,慢建索引不挡查询;构建期间读到的是旧状态,切换后新查询用新状态。
     - 写锁串行化更正:并发成功更正逐个生效、不丢失;构建失败抛异常,旧状态保留。
+    - ``revision`` 只在成功生效的更正后 +1;失败更正不影响修订号,也不影响未决确认。
     """
 
     def __init__(self, build_delay: float = 0.0):
@@ -244,7 +257,7 @@ class IndexManager:
         """应用一批增改删。upserts: [(编号, 正文, 分词序列)];deletes: [编号]。
 
         同一批内先删后增改;增改中重复编号后者覆盖前者。
-        成功返回 (新 State, 实际删除篇数);失败抛异常,当前状态不变。
+        成功返回 (新 State, 实际删除篇数);失败抛异常,当前状态不变、修订号不变。
         """
         with self._lock:
             docs = dict(self._state.docs)
@@ -256,11 +269,46 @@ class IndexManager:
                 docs[did] = (text, tuple(tokens))
             if len(docs) > MAX_DOCS:
                 raise CapacityError(f"更正后总篇数 {len(docs)} 超过上限 {MAX_DOCS},本批未生效")
-            new_state = self._build(docs)
+            new_state = self._build(docs, self._state.revision + 1)
             self._state = new_state  # 原子切换:之后的新查询使用新状态
             return new_state, deleted
 
-    def _build(self, docs: dict) -> State:
+    def suggest_correction(self, doc_id: str):
+        """生成纠错建议。查询不加写锁,基于一次完整快照;不修改任何状态。"""
+        state = self.current()
+        return build_suggestion(state.docs, state.revision, doc_id)
+
+    def confirm_correction(self, doc_id: str, revision: int, token: str):
+        """确认纠错建议:核对修订号与当前建议,原子更新分词与检索索引。
+
+        返回 (新 State, 本次应用的替换元组)。无替换时视为成功的空操作:
+        状态与修订号都不变。任何失败(修订号过期、建议不符、记录不存在等)
+        都抛异常且旧状态完整保留。
+        """
+        with self._lock:
+            state = self._state
+            if state.revision != revision:
+                raise RevisionConflict(
+                    f"语料修订号已由 {revision} 变为 {state.revision},请重新获取建议"
+                )
+            if doc_id not in state.docs:
+                raise RecordNotFound(f"记录 {doc_id!r} 不存在")
+            # 以当前语料重新计算建议:修订号相同即语料未变,此即“当前建议”
+            current = build_suggestion(state.docs, state.revision, doc_id)
+            if not hmac.compare_digest(
+                current.token.encode("utf-8"), token.encode("utf-8")
+            ):
+                raise SuggestionMismatch("提交的建议与当前语料下的建议不一致,请重新获取建议")
+            if not current.replacements:
+                return state, ()
+            text, _old_tokens = state.docs[doc_id]
+            docs = dict(state.docs)
+            docs[doc_id] = (text, tuple(current.suggested_tokens))
+            new_state = self._build(docs, state.revision + 1)
+            self._state = new_state  # 原子切换:分词与检索索引一起生效
+            return new_state, current.replacements
+
+    def _build(self, docs: dict, revision: int) -> State:
         if self._build_delay > 0:
             time.sleep(self._build_delay)  # 慢建索引:占写锁但不挡读者
-        return build_state(docs)
+        return build_state(docs, revision=revision)

@@ -1,6 +1,8 @@
 """FastAPI 入口:设备维修记录 BM25 精确检索。
 
 - POST /documents/batch  批量增改删(语料、全库统计、剪枝依据一起生效)
+- POST /corrections/suggest 分词纠错建议(整句联合最优,不改状态)
+- POST /corrections/confirm 确认纠错(核对修订号与建议,原子更新分词与索引)
 - POST /search           正式检索(BlockMax WAND 块上界剪枝)
 - POST /search/exhaustive 对照接口(全量计分后排序,仅用于验证一致性)
 - GET  /stats            当前状态统计
@@ -14,8 +16,20 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
+from .correction import RecordNotFound, RecordTooLong, RevisionConflict, SuggestionMismatch
 from .index import B, K1, MAX_DOCS, CapacityError, IndexManager, exhaustive_search, search
-from .schemas import BatchRequest, BatchResponse, Hit, SearchRequest, SearchResponse
+from .schemas import (
+    BatchRequest,
+    BatchResponse,
+    CorrectionConfirmRequest,
+    CorrectionConfirmResponse,
+    CorrectionSuggestRequest,
+    CorrectionSuggestResponse,
+    Hit,
+    ReplacementOut,
+    SearchRequest,
+    SearchResponse,
+)
 
 
 def create_app(manager: IndexManager | None = None) -> FastAPI:
@@ -51,6 +65,7 @@ def create_app(manager: IndexManager | None = None) -> FastAPI:
             "k1": K1,
             "b": B,
             "max_docs": MAX_DOCS,
+            "revision": s.revision,
         }
 
     @app.post("/documents/batch", response_model=BatchResponse, tags=["corpus"])
@@ -63,7 +78,63 @@ def create_app(manager: IndexManager | None = None) -> FastAPI:
             )
         except CapacityError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return BatchResponse(total=new_state.n, upserted=len(req.upserts), deleted=deleted)
+        return BatchResponse(
+            total=new_state.n,
+            upserted=len(req.upserts),
+            deleted=deleted,
+            revision=new_state.revision,
+        )
+
+    @app.post(
+        "/corrections/suggest",
+        response_model=CorrectionSuggestResponse,
+        tags=["corrections"],
+    )
+    def suggest_correction(req: CorrectionSuggestRequest):
+        """为现存记录生成分词纠错建议(只读):整句联合最优,同分取替换最少。"""
+        try:
+            sug = manager.suggest_correction(req.id)
+        except RecordNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RecordTooLong as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return CorrectionSuggestResponse(
+            id=sug.doc_id,
+            revision=sug.revision,
+            original_tokens=list(sug.original_tokens),
+            suggested_tokens=list(sug.suggested_tokens),
+            replacements=[
+                ReplacementOut(position=r.position, original=r.original, candidate=r.candidate)
+                for r in sug.replacements
+            ],
+            score=sug.score,
+            token=sug.token,
+        )
+
+    @app.post(
+        "/corrections/confirm",
+        response_model=CorrectionConfirmResponse,
+        tags=["corrections"],
+    )
+    def confirm_correction(req: CorrectionConfirmRequest):
+        """确认纠错:核对修订号与当前建议后,原子更新该记录分词与检索索引。"""
+        try:
+            new_state, applied = manager.confirm_correction(req.id, req.revision, req.token)
+        except RecordNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (RevisionConflict, SuggestionMismatch) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RecordTooLong as exc:  # 理论上建议阶段已拦截,防御性处理
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return CorrectionConfirmResponse(
+            id=req.id,
+            revision=new_state.revision,
+            applied=[
+                ReplacementOut(position=r.position, original=r.original, candidate=r.candidate)
+                for r in applied
+            ],
+            tokens=list(new_state.docs[req.id][1]),
+        )
 
     @app.post("/search", response_model=SearchResponse, tags=["search"])
     def search_ep(req: SearchRequest):
